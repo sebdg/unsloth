@@ -17,11 +17,13 @@ __all__ = [
     "test_chat_templates",
     "test_hf_gguf_equivalence",
     "remove_special_tokens",
-    "standardize_dataset",
 
-    "construct_chat_template",
+    "to_sharegpt",
+    "standardize_sharegpt",
+    "apply_chat_template",
+    "train_on_responses_only",
+
     "test_construct_chat_template",
-    "create_ollama_modelfile",
 ]
 
 from transformers import StoppingCriteria, StoppingCriteriaList
@@ -32,6 +34,7 @@ import os
 import shutil
 from .tokenizer_utils import *
 from .models._utils import patch_tokenizer
+import re
 
 CHAT_TEMPLATES = {}
 
@@ -414,6 +417,21 @@ gemma_chatml_eos_token = (
 CHAT_TEMPLATES["gemma_chatml"] = (gemma_chatml_template, gemma_chatml_eos_token, True, gemma_chatml_ollama,)
 pass
 
+# =========================================== Gemma 2
+# Same as Gemma 1, but with sliding window attention!
+# https://ollama.com/library/gemma2/blobs/6522ca797f47
+gemma2_template = gemma_template
+gemma2_ollama = gemma_ollama + "PARAMETER num_ctx 4096\n"
+gemma2_eos_token = "<end_of_turn>"
+CHAT_TEMPLATES["gemma2"] = (gemma2_template, gemma2_eos_token, True, gemma2_ollama,)
+
+# =========================================== Gemma 2 with ChatML instead
+gemma2_chatml_template = gemma_chatml_template
+gemma2_chatml_ollama = gemma_chatml_ollama + "PARAMETER num_ctx 4096\n"
+gemma2_chatml_eos_token = gemma_chatml_eos_token
+CHAT_TEMPLATES["gemma2_chatml"] = (gemma2_chatml_template, gemma2_chatml_eos_token, True, gemma2_chatml_ollama,)
+pass
+
 # =========================================== Llama-3
 # Weirdly \n\n is needed?
 llama3_template = \
@@ -528,6 +546,7 @@ def get_chat_template(
         chat_template, stop_word = chat_template
         assert(type(chat_template) is str)
         assert(type(stop_word) is str)
+        ollama_modelfile = None
 
     elif type(chat_template) is str:
 
@@ -712,21 +731,209 @@ def remove_special_tokens(tokenizer, prompt):
 pass
 
 
-def standardize_dataset(
+def _parse_combined_prompt(combined_prompt, dataset):
+    # Find {...}
+    possible_columns = re.findall(r"\{(.+?)\}", combined_prompt)
+    dataset_columns = set(dataset.column_names)
+    for column in possible_columns:
+        if column not in dataset_columns:
+            raise KeyError(
+                f"Unsloth: Your prompt includes '{column}' but this does not exist in the dataset. "\
+                f"Only allowed columns are {list(dataset_columns)}"
+            )
+        pass
+    pass
+
+    # Find [[...]]
+    optional_prompts = list(re.finditer(r"\[\[.+?\]\]", combined_prompt, flags = re.DOTALL | re.MULTILINE))
+    optional_prompts = [(x.span(), x.group(0)) for x in optional_prompts]
+
+    final_optional_prompts = []
+    if len(optional_prompts) != 0:
+        # Add left
+        left = optional_prompts[0]
+        l = left[0][0]
+        if l != 0: final_optional_prompts.append(combined_prompt[:l])
+
+        # Add in between
+        for left, right in zip(optional_prompts[:-1], optional_prompts[1:]):
+            l, r = left[0][-1], right[0][0]
+            final_optional_prompts.append(left)
+            if l != r: final_optional_prompts.append(combined_prompt[l : r])
+        pass
+        final_optional_prompts.append(optional_prompts[-1])
+
+        # Add right
+        right = optional_prompts[-1]
+        r = right[0][1]
+        if r != len(combined_prompt): final_optional_prompts.append(combined_prompt[r:])
+    else:
+        # Just add in the entire string
+        final_optional_prompts.append(combined_prompt)
+    pass
+
+    check_combined = "".join(x if type(x) is str else x[1] for x in final_optional_prompts)
+    assert(combined_prompt == check_combined)
+
+    return possible_columns, final_optional_prompts
+pass
+
+
+def _create_formatter(possible_columns, final_optional_prompts, user_column_name):
+    # Start final prompt!
+    function = ["def __combined_prompt_processor__(examples):"]
+    columns = list(set(possible_columns))
+    for column in columns:
+        function.append(f"{' '*4}{column}__ = examples['{column}']")
+    function.append(f"{' '*4}texts = []")
+    function.append(f"{' '*4}for ({', '.join(columns)}) in zip({', '.join(f'{x}__' for x in columns)}):")
+
+    # Add optional tags as well!
+    final_prompt = ""
+    formatter = []
+
+    for j, optional_prompt in enumerate(final_optional_prompts):
+        if type(optional_prompt) is str:
+            columns = re.findall(r"\{(.+?)\}", optional_prompt)
+            formatter += columns
+            # Must escape \n \r
+            final_prompt += optional_prompt.encode("unicode-escape").decode("utf-8").replace("'", "\\'").replace('"', '\\"')
+        else:
+            where, prompt = optional_prompt
+            # Strip [[...]]
+            # Must escape \n \r
+            prompt = prompt[2:-2].encode("unicode-escape").decode("utf-8").replace("'", "\\'").replace('"', '\\"')
+            columns = re.findall(r"\{(.+?)\}", prompt)
+            x = f"__optional_{j}__"
+            prompt = f"{' '*8}{x} = '{prompt}'.format({', '.join(f'{x} = {x}' for x in columns)}) if {columns[0]} else ''"
+            function.append(prompt)
+            formatter.append(x)
+            final_prompt += "{" + x + "}"
+        pass
+    pass
+
+    function.insert(1, f"{' '*4}__combined_prompt__ = '{final_prompt}'")
+    function.append(f"{' '*8}texts.append("\
+                    f"__combined_prompt__.format({', '.join(f'{x} = {x}' for x in formatter)}))")
+    function.append(f"{' '*4}return " + "{ " + f"'{user_column_name}' : texts" + " }")
+    return "\n".join(function)
+pass
+
+
+def to_sharegpt(
     dataset,
-    conversation_key = "conversations",
-    system_message = None,
+    merged_prompt = "",
+    merged_column_name = "instruction",
+    output_column_name = "output",
+    remove_unsued_columns = True,
+    conversation_extension = 1,
+    random_state = 3407,
+):
+    """
+    Converts a dataset to ShareGPT style.
+    ShareGPT requires only 1 input and 1 output field.
+    This means one has to merge multiple columns into 1 for 1 input field.
+    Use `conversation_extension` to increase the length of each conversation by randomnly
+    selecting a few and packing them into 1.
+
+    merged_prompt = "",                 Prompt to merge columns into 1 input
+    merged_column_name = "instruction", Final column name for the input  field
+    output_column_name = "output",      Final column name for the output field
+    remove_unsued_columns = True,
+    conversation_extension = 1,         Automatically combines `conversation_extension` convos into 1
+    random_state = 3407,
+    """
+    if "conversations" in dataset.column_names:
+        convo = dataset[0]["conversations"]
+        if type(convo) is list:
+            raise TypeError("Unsloth: Your dataset is probably already in ShareGPT format!")
+        pass
+    pass
+
+    possible_columns, final_optional_prompts = _parse_combined_prompt(merged_prompt, dataset)
+    function = _create_formatter(possible_columns, final_optional_prompts, merged_column_name)
+    exec(function, globals())
+    dataset = dataset.map(__combined_prompt_processor__, batched = True, desc = "Merging columns")
+
+    def __convert_to_sharegpt__(examples):
+        users      = examples[merged_column_name]
+        assistants = examples[output_column_name]
+        texts = [
+            [
+                {"from" : "user",      "content" : str(user)     },
+                {"from" : "assistant", "content" : str(assistant)},
+            ] \
+            for user, assistant in zip(users, assistants)
+        ]
+        return { "conversations" : texts, }
+    pass
+
+    dataset = dataset.map(
+        __convert_to_sharegpt__,
+        batched = True,
+        desc = "Converting to ShareGPT",
+        # Remove unsued columns!
+        remove_columns = dataset.column_names if remove_unsued_columns else None,
+    )
+
+    # Randomnly concat conversations to create a long stream!
+    from datasets import concatenate_datasets
+    n_extensions = max(conversation_extension-1, 0)
+    if n_extensions == 0: return dataset
+
+    dataset = dataset.rename_columns({"conversations" : f"conversations0"})
+    all_shuffled = [dataset]
+    for j in range(1, n_extensions+1):
+        shuffled = dataset.shuffle(seed = random_state+j).rename_columns({"conversations0" : f"conversations{j}"})
+        all_shuffled.append(shuffled)
+    pass
+    dataset = concatenate_datasets(all_shuffled, axis = 1)
+
+    # Combine them into 1
+    function = "def __combine_conversations__(examples):\n"
+    n_extensions += 1
+    for j in range(n_extensions):
+        function += f"{' '*4}conversations{j}__ = examples['conversations{j}']\n"
+    function += f"{' '*4}convos = []\n"
+    function += f"{' '*4}for ({', '.join(f'conversations{j}' for j in range(n_extensions))}) "\
+                f"in zip({', '.join(f'conversations{j}__' for j in range(n_extensions))}):\n"
+    function += f"{' '*8}convos.append("\
+                f"{'+'.join(f'conversations{j}' for j in range(n_extensions))})\n"
+    function += f"{' '*4}return " + "{ " + f"'conversations' : convos" + " }"
+
+    # Map function
+    exec(function, globals())
+    dataset = dataset.map(
+        __combine_conversations__,
+        batched = True,
+        desc = "Extending conversations",
+        # Remove unsued columns!
+        remove_columns = dataset.column_names if remove_unsued_columns else None,
+    )
+    return dataset
+pass
+
+
+def standardize_sharegpt(
+    dataset,
     aliases_for_system    = ["system",],
     aliases_for_user      = ["user", "human", "input",],
     aliases_for_assistant = ["gpt", "assistant", "output",],
 ):
     """
-        Standardizes ShareGPT and other formats to user/assistant Hugging Face format.
+    Standardizes ShareGPT and other formats to user/assistant Hugging Face format.
+    
+    Get aliases for the system, user and assistant roles.
+    These shall map to "system", "user" and "assistant" respectively.
+    
+    aliases_for_system    = ["system",],
+    aliases_for_user      = ["user", "human", "input",],
+    aliases_for_assistant = ["gpt", "assistant", "output",],
     """
     import collections
     import itertools
 
-    convos = dataset[:10][conversation_key]
+    convos = dataset[:10]["conversations"]
     uniques = collections.defaultdict(list)
     for convo in convos:
         for message in convo:
@@ -767,24 +974,19 @@ def standardize_dataset(
     for x in aliases_for_assistant: aliases_mapping[x] = "assistant"
 
     def _standardize_dataset(examples):
-        convos = examples[conversation_key]
+        convos = examples["conversations"]
         all_convos = []
         for convo in convos:
-            new_convo = []
-            if len(convo) == 0: continue
-            has_system = aliases_mapping[convo[0][role_key]] == "system"
-            if not has_system and system_message is not None:
-                new_convo.append({ "role" : "system", "content" : system_message, })
-            for message in convo:
-                role = aliases_mapping[message[role_key]]
-                new_convo.append({ "role" : role, "content" : message[content_key], })
-            pass
+            new_convo = [
+                { "role" : aliases_mapping[message[role_key]], "content" : message[content_key], }
+                for message in convo
+            ]
             all_convos.append(new_convo)
         pass
-        return { conversation_key : all_convos, }
+        return { "conversations" : all_convos, }
     pass
 
-    return dataset.map(_standardize_dataset, batched = True,)
+    return dataset.map(_standardize_dataset, batched = True, desc = "Standardizing format")
 pass
 
 
@@ -828,7 +1030,17 @@ def get_ollama_eos_tokens(tokenizer, extra_eos_tokens = []):
     pass
     final_eos_tokens += extra_eos_tokens
     final_eos_tokens += repeatted_tokens
-    return final_eos_tokens
+
+    # Remove new lines, spaces and HTML tags
+    filtered_eos_tokens = []
+    for token in final_eos_tokens:
+        if   token.count("\n") == len(token): continue
+        elif token.count("▁") == len(token): continue
+        elif token.startswith("<") and len(token) <= 2: continue
+        elif token.startswith("</") and len(token) == 3: continue
+        filtered_eos_tokens.append(token)
+    pass
+    return filtered_eos_tokens
 pass
 
 
@@ -836,7 +1048,7 @@ def construct_chat_template( \
 
 tokenizer = None,
 
-template = """<|begin_of_text|><|start_header_id|>system<|end_header_id|>
+chat_template = """<|begin_of_text|><|start_header_id|>system<|end_header_id|>
 
 {SYSTEM}<|eot_id|><|start_header_id|>user<|end_header_id|>
 
@@ -850,9 +1062,8 @@ template = """<|begin_of_text|><|start_header_id|>system<|end_header_id|>
     
 default_system_message = \
     "Below are some instructions that describe some tasks. Write responses that appropriately complete each request.",
-  
+
 extra_eos_tokens = None,
-  
 ):
     """
     Creates a Ollama modelfile and a HF Jinja template from a custom
@@ -861,9 +1072,13 @@ extra_eos_tokens = None,
 
     You must use {INPUT}, {OUTPUT} twice, and {SYSTEM} is optional.
     """
+    # Strip only the left
+    chat_template = chat_template.lstrip()
+
     assert(tokenizer is not None)
 
     if extra_eos_tokens is None: extra_eos_tokens = []
+    elif type(extra_eos_tokens) is str: extra_eos_tokens = [extra_eos_tokens,]
 
     vocab = tokenizer.get_vocab()
     for extra_eos in extra_eos_tokens:
@@ -882,62 +1097,132 @@ extra_eos_tokens = None,
         "### Input:\\n{INPUT}\\n\\n### Response:\\n{OUTPUT}\\n"\
         "### Input:\\n{INPUT}\\n\\n### Response:\\n{OUTPUT}\\n"
 
-    # O(N^2) search finding 2 repeatted pieces of text
-    j = len(template)-1
-    at_least_one = False
-    while j > 0:
-        found = template.rfind(template[j:], 0, j)
-        if found == -1: break
-        j -= 1
-        at_least_one = True
-    pass
-    if j > 0: j += 1
-    else: raise RuntimeError(error_msg)
-
-
-    if not at_least_one: raise RuntimeError(error_msg)
-
-    # Repeatted text
-    instruction_response = template[j:]
-    if instruction_response.count("{INPUT}") != 1 or instruction_response.count("{OUTPUT}") != 1:
-        raise RuntimeError(error_msg)
-    pass
-
-    # 1st System, Instruction, Output pair
-    left  = template[:j]
-    # 2nd Instruction, Output pair
-    right = template[j:]
-
-    # Isolate input
-    extra_eos_tokens_regex = "|".join(f"(?:{re.escape(x)})" for x in extra_eos_tokens)
-    if len(extra_eos_tokens_regex) != 0:
-        find_end = f"(?:{extra_eos_tokens_regex})?"
-    else:
-        find_end = ""
-    find_end = r"\{INPUT\}[\s\n]{0,}" + find_end
-    input_end = list(re.finditer(find_end, right))
-    assert(len(input_end) == 1)
-    input_end = input_end[0]
-    input_end = input_end.span(0)[1]
-    input_part = right[:input_end]
-
-    # Isolate output
-    output_part = right[input_end:]
-
-    # Isolate system
-    system_part = left[:left.find(input_part)]
-
-    # Check if the user provided a correct prompt
-    combined = system_part + input_part + output_part
-    if combined != left:
-        combined_changed = combined.replace('\n', '\\n')
-        left_changed     = left    .replace('\n', '\\n')
+    # Check for EOS after {OUTPUT}
+    if tokenizer.eos_token is not None:
+        extra_eos_tokens.insert(0, tokenizer.eos_token)
+    if len(extra_eos_tokens) == 0:
         raise RuntimeError(
-            "Unsloth: The prompt template you provided isn't correct. You gave:\n"\
-            f"{combined_changed}\n\n"\
-            "But we require the following:\n"\
-            f"{left_changed}"
+            "Unsloth: Your tokenizer does not have an EOS token? Please provide one via extra_eos_tokens!"
         )
+    pass
+
+    # Check tokenizer types
+    tokenizer_name = tokenizer.name_or_path.lower()
+    if tokenizer_name.startswith(("unsloth/llama-3-8b-instruct", "unsloth/llama-3-70b-instruct")):
+        # Add <|eot_id|>
+        extra_eos_tokens.append("<|eot_id|>")
+    elif ("<|eot_id|>" in extra_eos_tokens or "<|eot_id|>" in chat_template) and \
+        tokenizer_name.startswith(("unsloth/llama-3-8b", "unsloth/llama-3-70b")):
+        # Warn
+        logger.warning(
+            "Unsloth: Base llama-3 models did not train <|eot_id|>.\n"\
+            "Please use the instruct version or use <|end_of_text|>"
+        )
+    pass
+    extra_eos_tokens = list(set(extra_eos_tokens))
+
+    count_eos = 0
+    for eos in extra_eos_tokens:
+        count_eos += len(re.findall(r"{OUTPUT}" + re.escape(eos), chat_template))
+    pass
+
+    # This forces you to provide 2 input and outputs
+    final_combined_check = False
+
+    try:
+        # O(N^2) search finding 2 repeatted pieces of text
+        j = len(chat_template)-1
+        at_least_one = False
+        while j > 0:
+            found = chat_template.rfind(chat_template[j:], 0, j)
+            if found == -1: break
+            j -= 1
+            at_least_one = True
+        pass
+        if j > 0: j += 1
+        else: raise RuntimeError(error_msg)
+
+        if not at_least_one: raise RuntimeError(error_msg)
+
+        # Must be equivalent to left
+        final_combined_check = True
+
+        # Repeatted text
+        instruction_response = chat_template[j:]
+        if instruction_response.count("{INPUT}") != 1 or instruction_response.count("{OUTPUT}") != 1:
+            raise RuntimeError(error_msg)
+        pass
+
+        # 1st System, Instruction, Output pair
+        left  = chat_template[:j]
+        # 2nd Instruction, Output pair
+        right = chat_template[j:]
+
+        final_combined_check = left if final_combined_check else chat_template
+
+        # Isolate input
+        extra_eos_tokens_regex = "|".join(f"(?:{re.escape(x)})" for x in extra_eos_tokens)
+        if len(extra_eos_tokens_regex) != 0:
+            find_end = f"(?:{extra_eos_tokens_regex})?"
+        else:
+            find_end = ""
+        find_end = r"\{INPUT\}[\s\n]{0,}" + find_end
+        input_end = list(re.finditer(find_end, right))
+        assert(len(input_end) == 1)
+        input_end = input_end[0]
+        input_end = input_end.span(0)[1]
+        input_part = right[:input_end]
+
+        # Isolate output
+        output_part = right[input_end:]
+
+        # Isolate system
+        where_system = left.find(input_part)
+        system_part = left[:where_system if where_system != -1 else len(left)]
+
+        # Check if the user provided a correct prompt
+        combined = system_part + input_part + output_part
+        if combined != final_combined_check:
+            combined_changed = combined            .replace('\n', '\\n')
+            left_changed     = final_combined_check.replace('\n', '\\n')
+            raise RuntimeError(
+                "Unsloth: The prompt template you provided isn't correct. You gave:\n"\
+                f"{combined_changed}\n\n"\
+                "But we require the following:\n"\
+                f"{left_changed}"
+            )
+        pass
+    except:
+        ending = chat_template[chat_template.find("{OUTPUT}") + len("{OUTPUT}"):]
+
+        ending = re.escape(ending)
+        find_text = "{INPUT}" + ending + "(.+?{OUTPUT}" + ending + ")"
+        response_part = re.findall(find_text, chat_template, flags = re.DOTALL | re.MULTILINE)
+        response_part = response_part[0]
+
+        for j in range(1, len(response_part)):
+            try_find = re.escape(response_part[:j])
+            try: found = next(re.finditer("(" + try_find + ").+?\{INPUT\}", chat_template, flags = re.DOTALL | re.MULTILINE))
+            except: break
+        pass
+        separator = found.group(1)
+
+        response_start = chat_template.find(response_part)
+        start_instruction = chat_template[:response_start].rfind(separator)
+        if start_instruction == -1: start_instruction = 0
+        instruction_part = chat_template[start_instruction:response_start]
+
+        combined = instruction_part + response_part
+        where = chat_template.find(combined)
+        system_part = chat_template[:where]
+
+        system_part, input_part, output_part = system_part, instruction_part, response_part
+    pass
+
+    if count_eos == 0:
+        logger.warning("Unsloth: We automatically added an EOS token to stop endless generations.")
+        eos = extra_eos_tokens[0]
+        output_part = output_part + eos
     pass
 
     # Ollama modelfile parts
@@ -945,20 +1230,22 @@ extra_eos_tokens = None,
     # Check bos_token is in system prompt
     ollama_system = system_part
     has_bos_token = False
+    always_bos_token = False
     if tokenizer("A").input_ids[0] == getattr(tokenizer, "bos_token_id", None):
+        always_bos_token = True
         if ollama_system.startswith(tokenizer.bos_token):
             has_bos_token = True
             ollama_system = ollama_system[len(tokenizer.bos_token):]
         pass
     pass
-    system_modelfile = "{{ if .System }}" + ollama_system.replace("{SYSTEM}", "{{ .System }}") + "{{ end }}"
+    # Check system
+    if "{SYSTEM}" in ollama_system:
+        system_modelfile = "{{ if .System }}" + ollama_system.replace("{SYSTEM}", "{{ .System }}") + "{{ end }}"
+    else:
+        system_modelfile = ollama_system
+    pass
     input_modelfile  = "{{ if .Prompt }}" + input_part .replace("{INPUT}",  "{{ .Prompt }}") + "{{ end }}"
     output_modelfile = output_part.replace("{OUTPUT}", "{{ .Response }}")
-
-    # Check if EOS token is at the end of the output
-    if not output_modelfile.endswith(tuple(extra_eos_tokens)):
-        output_modelfile += "{__EOS_TOKEN__}"
-    pass
 
     # Ollama EOS
     ollama_eos = get_ollama_eos_tokens(tokenizer, extra_eos_tokens)
@@ -1004,18 +1291,28 @@ extra_eos_tokens = None,
         partial_system = process(system_part, "{SYSTEM}", "messages[0]['content']")
         partial_system = partial_system.replace("{SYSTEM}", "")
 
+        if "{SYSTEM}" in partial_system:
+            if default_system_message is None:
+                raise RuntimeError("Unsloth: Please specify a default system message!")
+        pass
+
         # Separate the BOS
         if has_bos_token:
             partial_system = partial_system.replace(tokenizer.bos_token, "", 1)
+            system_part    = system_part   .replace(tokenizer.bos_token, "", 1)
         pass
-
+        
         partial_system = \
             "{% if messages[0]['role'] == 'system' %}"\
                 "{{ " + partial_system + " }}"\
                 "{% set loop_messages = messages[1:] %}"
         if default_system_message is not None:
+            full_system = system_part.replace("{SYSTEM}", default_system_message)
+            if "{SYSTEM}" in system_part:
+                modelfile += '\nSYSTEM "' + default_system_message + '"'
+            pass
             partial_system += "{% else %}"\
-                "{{ '" + system_part.replace("{SYSTEM}", default_system_message) + "' }}"\
+                "{{ '" + full_system + "' }}"\
                 "{% set loop_messages = messages %}"\
             "{% endif %}"
         else:
@@ -1028,7 +1325,35 @@ extra_eos_tokens = None,
             jinja_template = "{{ bos_token }}" + jinja_template
     pass
 
-    return modelfile, jinja_template
+    # Fix missing loop_messages
+    if "{% set loop_messages = messages %}" not in jinja_template:
+        jinja_template = jinja_template.replace(
+            "{% for message in loop_messages %}",
+            "{% for message in messages %}",
+            1, # Only replace the first one
+        )
+    pass
+
+    # Check if system part is the same!
+    jinja_template = re.sub(
+        r"\{\% if messages\[0\]\['role'\] \=\= 'system' \%\}\{\{ '(.+?)' \}\}"\
+        r"\{\% set loop\_messages \= messages\[1\:\] \%\}"\
+        r"\{\% else \%\}\{\{ '\1' \}\}\{\% set loop\_messages \= messages \%\}\{\% endif \%\}"\
+        r"\{\% for message in loop\_messages \%\}",
+        r"{{ '\1' }}{% for message in messages %}",
+        jinja_template, flags = re.MULTILINE | re.DOTALL,
+    )
+
+    # Check jinja tempate for bos
+    if always_bos_token:
+        if not jinja_template.startswith("{{ bos_token }}"):
+            jinja_template = "{{ bos_token }}" + jinja_template
+    pass
+
+    # Get instruction and output parts for train_on_inputs = False
+    input_part  = input_part [:input_part .find("{INPUT}")]
+    output_part = output_part[:output_part.find("{OUTPUT}")]
+    return modelfile, jinja_template, input_part, output_part
 pass
 
 
@@ -1037,7 +1362,7 @@ def test_construct_chat_template():
     from transformers import AutoTokenizer
     tokenizer = AutoTokenizer.from_pretrained("meta-llama/Meta-Llama-3-8B-Instruct", token = token)
 
-    template = """<|begin_of_text|><|start_header_id|>system<|end_header_id|>
+    chat_template = """<|begin_of_text|><|start_header_id|>system<|end_header_id|>
 
 {SYSTEM}<|eot_id|><|start_header_id|>user<|end_header_id|>
 
@@ -1054,7 +1379,11 @@ def test_construct_chat_template():
       
     extra_eos_tokens = None
 
-    modelfile, jinja_template = construct_chat_template(template, default_system_message, extra_eos_tokens)
+    modelfile, jinja_template, _, _ = construct_chat_template(
+        tokenizer = tokenizer,
+        chat_template = chat_template,
+        extra_eos_tokens = extra_eos_tokens,
+    )
 
     messages = [
         {"role": "system", "content": "You are an assistant"},
@@ -1068,46 +1397,133 @@ def test_construct_chat_template():
 
     tokenizer.chat_template = jinja_template
     new_output = tokenizer.apply_chat_template(messages, tokenize = False, add_generation_prompt = True)
-
     assert(correct_output == new_output)
     pass
 pass
 
 
-def create_ollama_modelfile(tokenizer, gguf_location):
+def apply_chat_template( \
+
+dataset,
+tokenizer = None,
+
+chat_template = """<|begin_of_text|><|start_header_id|>system<|end_header_id|>
+
+{SYSTEM}<|eot_id|><|start_header_id|>user<|end_header_id|>
+
+{INPUT}<|eot_id|><|start_header_id|>assistant<|end_header_id|>
+
+{OUTPUT}<|eot_id|><|start_header_id|>user<|end_header_id|>
+
+{INPUT}<|eot_id|><|start_header_id|>assistant<|end_header_id|>
+
+{OUTPUT}<|eot_id|>""",
+    
+default_system_message = \
+    "Below are some instructions that describe some tasks. Write responses that appropriately complete each request.",
+  
+extra_eos_tokens = None,
+  
+):
     """
-        Creates an Ollama Modelfile.
-        Use ollama.create(model = "new_ollama_model", modelfile = modelfile)
+    Creates a Ollama modelfile and a HF Jinja template from a custom
+    template. You must provide 2x examples of an input & output.
+    There is an optional system message as well.
+
+    You must use {INPUT}, {OUTPUT} twice, and {SYSTEM} is optional.
     """
-    modelfile = getattr(tokenizer, "_ollama_modelfile", None)
-    if modelfile is None:
-        raise RuntimeError(
-            "Unsloth: Tokenizer does not have a `ollama_modelfile` attribute.\n"\
-            "Please use get_chat_template(...)."
-        )
+    modelfile, jinja_template, input_part, output_part = construct_chat_template(
+        tokenizer = tokenizer,
+        chat_template = chat_template,
+        default_system_message = default_system_message,
+        extra_eos_tokens = extra_eos_tokens,
+    )
+    def formatting_prompts_func(examples):
+        convos = examples["conversations"]
+        texts = [tokenizer.apply_chat_template(convo, tokenize = False, add_generation_prompt = False) for convo in convos]
+        return { "text" : texts, }
     pass
 
-    system_message = getattr(tokenizer, "_system_message", None)
-    if system_message is None:
-        __SYSTEM_MESSAGE__ = ""
+    tokenizer.chat_template = jinja_template
+    tokenizer._ollama_modelfile = modelfile
+    tokenizer._unsloth_input_part  = input_part
+    tokenizer._unsloth_output_part = output_part
+
+    return dataset.map(formatting_prompts_func, batched = True,)
+pass
+
+
+def train_on_responses_only(
+    trainer,
+    instruction_part = None,
+    response_part    = None,
+):
+    """
+    Trains only on responses and not on the instruction by masking out
+    the labels with -100 for the instruction part.
+    """
+    tokenizer = trainer.tokenizer
+    
+    if  not hasattr(tokenizer, "_unsloth_input_part") or \
+        not hasattr(tokenizer, "_unsloth_output_part"):
+        
+        if instruction_part is None or response_part is None:
+            raise ValueError("Unsloth: instruction_part and response_part must be given!")
+        pass
+    elif (instruction_part is not None or response_part is not None) and \
+        (hasattr(tokenizer, "_unsloth_input_part") or hasattr(tokenizer, "_unsloth_output_part")):
+
+        raise ValueError("Unsloth: Your tokenizer already has instruction and response parts set - do not give custom ones!")
     else:
-        __SYSTEM_MESSAGE__ = f'SYSTEM """{system_message}"""'
+        instruction_part = tokenizer._unsloth_input_part
+        response_part    = tokenizer._unsloth_output_part
     pass
 
-    modelfile = modelfile\
-        .replace("{{", "⚫@✅#🦥")\
-        .replace("}}", "⚡@🦥#⛵")\
-        .format(
-            __FILE_LOCATION__  = gguf_location,
-            __SYSTEM_MESSAGE__ = __SYSTEM_MESSAGE__,
-            __EOS_TOKEN__      = tokenizer.eos_token,
-        )\
-        .replace("⚫@✅#🦥", "{{")\
-        .replace("⚡@🦥#⛵", "}}")\
-        .rstrip()
-    pass
+    instruction_ids = tokenizer(instruction_part,  add_special_tokens = False).input_ids
+    response_ids    = tokenizer(response_part, add_special_tokens = False).input_ids
 
-    return modelfile
+    instruction_length = len(instruction_ids)
+    response_length    = len(response_ids)
+    max_length = max(instruction_length, response_length)
+
+    def _train_on_responses_only(examples):
+        input_ids_ = examples["input_ids"]
+        all_labels = []
+
+        for input_ids in input_ids_:
+
+            labels = [-100] * len(input_ids)
+            m = len(input_ids) - max_length
+            first_response    = response_ids[0]
+            first_instruction = instruction_ids[0]
+            j = 0
+            while j < m:
+                if input_ids[j] == first_response:
+                    if input_ids[j : j+response_length] == response_ids:
+                        j = j + response_length
+                        start = j
+                        while j < m:
+                            if input_ids[j] == first_instruction and input_ids[j : j+instruction_length] == instruction_ids:
+                                j = j + instruction_length
+                                labels[start : j] = input_ids[start : j]
+                                break
+                            elif j == (m-1):
+                                j = m
+                                labels[start:] = input_ids[start:]
+                                break
+                            pass
+                            j += 1
+                        pass
+                    pass
+                pass
+                j += 1
+            pass
+            all_labels.append(labels)
+        pass
+        return { "labels" : all_labels }
+    pass
+    trainer.train_dataset = trainer.train_dataset.map(_train_on_responses_only, batched = True)
+    return trainer
 pass
 
 

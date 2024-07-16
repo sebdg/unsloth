@@ -13,7 +13,10 @@
 # limitations under the License.
 
 from .llama import *
-
+from .llama import (
+    LlamaRotaryEmbedding,
+    LlamaLinearScalingRotaryEmbedding,
+)
 from transformers.models.qwen2.modeling_qwen2 import (
     Qwen2Attention,
     Qwen2DecoderLayer,
@@ -36,6 +39,16 @@ class FastQwen2Model(FastLlamaModel):
 
     @staticmethod
     def pre_patch():
+        init_name, function = patch_linear_scaling(
+            model_name         = "qwen2",
+            rope_module        = LlamaRotaryEmbedding,
+            scaled_rope_module = LlamaLinearScalingRotaryEmbedding,
+            attention_module   = Qwen2Attention,
+        )
+        if init_name is not None:
+            exec(function, globals())
+            Qwen2Attention.__init__  = eval(init_name)
+        pass
         Qwen2Attention      .forward = LlamaAttention_fast_forward
         Qwen2SdpaAttention  .forward = LlamaAttention_fast_forward
         Qwen2FlashAttention2.forward = LlamaAttention_fast_forward
@@ -43,6 +56,7 @@ class FastQwen2Model(FastLlamaModel):
         Qwen2Model          .forward = LlamaModel_fast_forward
         Qwen2ForCausalLM    .forward = CausalLM_fast_forward(LlamaModel_fast_forward_inference)
         PeftModelForCausalLM.forward = PeftModelForCausalLM_fast_forward
+        fix_prepare_inputs_for_generation(Qwen2ForCausalLM)
 
         # Solves https://github.com/unslothai/unsloth/issues/168
         # Static KV Cache was introduced in 4.38.0, causing training to be much slower.

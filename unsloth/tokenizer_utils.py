@@ -24,6 +24,7 @@ import itertools
 import collections
 import numpy as np
 import gc
+import subprocess
 
 __all__ = [
     "load_correct_tokenizer",
@@ -376,7 +377,7 @@ def fix_sentencepiece_gguf(saved_location):
     """
         Fixes sentencepiece tokenizers which did not extend the vocabulary with
         user defined tokens.
-        Inspiration from https://github.com/ggerganov/llama.cpp/blob/master/convert-hf-to-gguf.py
+        Inspiration from https://github.com/ggerganov/llama.cpp/blob/master/convert_hf_to_gguf.py
     """
     from copy import deepcopy
     from transformers.utils import sentencepiece_model_pb2
@@ -735,7 +736,8 @@ def fix_untrained_tokens(model, tokenizer, train_dataset, eps = 1e-16):
         raise ValueError(
             'Unsloth: Untrained tokens found, but embed_tokens & lm_head not trainable, causing NaNs. '\
             'Restart then add `embed_tokens` & `lm_head` to '\
-            '`FastLanguageModel.get_peft_model(target_modules = [..., "embed_tokens", "lm_head",])`',
+            '`FastLanguageModel.get_peft_model(target_modules = [..., "embed_tokens", "lm_head",]). `'\
+            'Are you using the `base` model? Instead, use the `instruct` version to silence this warning.',
         )
     pass
 
@@ -906,6 +908,21 @@ def add_new_tokens(
 pass
 
 
+def check_nvidia():
+    # Unsloth doesn't work yet on AMD devices - we're working on it!
+    output = np.array([0,])
+    try:
+        output = subprocess.check_output("nvidia-smi --query-gpu=memory.used --format=csv", shell = True)
+        output = re.findall(rb'([\d]{1,})[\s]{1,}M', output)
+        output = np.array([int(x.decode('utf-8'))/1024 for x in output])
+    except:
+        if not torch.cuda.is_available():
+            raise RuntimeError("Unsloth: We do not support AMD / Intel machines yet - it is a work in progress!")
+    return output
+pass
+PRE_CHECK = check_nvidia()
+
+
 from inspect import getsource
 import trl.trainer.sft_trainer
 from trl.trainer.sft_trainer import *
@@ -953,17 +970,20 @@ def patch_sft_trainer_tokenizer():
     "\n"\
     "if self._inner_training_loop.__name__ != '_fast_inner_training_loop':\n"\
     "    raise RuntimeError(\n"\
-    "       'Do not edit specific areas of the Unsloth codebase or you will get CUDA segfaults.'\n"\
+    "       'Please do not edit specific areas of the Unsloth codebase or you will get CUDA segfaults.'\n"\
     "    )\n"\
     "pass\n"\
-    "n_devices = torch.cuda.device_count()\n"\
-    "import subprocess, re\n"\
-    "output = subprocess.check_output(\n"\
-    "    'nvidia-smi --query-gpu=memory.used --format=csv', shell = True)\n"\
-    "output = re.findall(rb'([\\d]{1,})[\\s]{1,}M', output)\n"\
-    "output = sum(int(x.decode('utf-8'))/1024 > 4 for x in output)\n"\
-    "if output > 1: raise RuntimeError(\n"\
-    "    'Error: More than 1 GPUs have a lot of VRAM usage. Please obtain a commercial license.')\n"\
+    "import subprocess, re, gc, numpy as np\n"\
+    "a = np.array([0,])\n"\
+    "try:\n"\
+    "    a = subprocess.check_output('nvidia-smi --query-gpu=memory.used --format=csv', shell = True)\n"\
+    "    a = re.findall(rb'([\\d]{1,})[\\s]{1,}M', a)\n"\
+    "    a = np.array([int(x.decode('utf-8'))/1024 for x in a])\n"\
+    "except:\n"\
+    "    if not torch.cuda.is_available():\n"\
+    "        raise RuntimeError('Unsloth: We do not support AMD / Intel machines yet - it is a work in progress!')\n"\
+    "if ((a - PRE_CHECK) >= 1).sum() > 1:\n"\
+    "    raise RuntimeError('Unsloth currently does not support multi GPU setups - but we are working on it!')\n"\
     "for _ in range(3):\n"\
     "    gc.collect()\n"\
     "    torch.cuda.empty_cache()\n"\

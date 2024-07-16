@@ -15,7 +15,10 @@
 from .llama import *
 import os
 from ._utils import __version__
-
+from .llama import (
+    LlamaRotaryEmbedding,
+    LlamaLinearScalingRotaryEmbedding,
+)
 from transformers.models.mistral.modeling_mistral import (
     MistralAttention,
     MistralDecoderLayer,
@@ -240,7 +243,7 @@ def MistralForCausalLM_fast_forward(
         shift_logits = logits
         if not hasattr(self, "extra_ignored_labels"):
             # Fixes https://github.com/unslothai/unsloth/issues/10
-            self.extra_ignored_labels = torch.full((self.max_seq_length, 1), -100, device = "cuda")
+            self.extra_ignored_labels = torch.full((self.max_seq_length, 1), -100, device = "cuda:0")
         pass
         
         shift_labels = torch.hstack((labels[..., 1:], self.extra_ignored_labels[:labels.shape[0]]))
@@ -268,6 +271,16 @@ class FastMistralModel(FastLlamaModel):
 
     @staticmethod
     def pre_patch():
+        init_name, function = patch_linear_scaling(
+            model_name         = "mistral",
+            rope_module        = LlamaRotaryEmbedding,
+            scaled_rope_module = LlamaLinearScalingRotaryEmbedding,
+            attention_module   = MistralAttention,
+        )
+        if init_name is not None:
+            exec(function, globals())
+            MistralAttention.__init__  = eval(init_name)
+        pass
         MistralAttention      .forward = MistralAttention_fast_forward
         MistralSdpaAttention  .forward = MistralAttention_fast_forward
         MistralFlashAttention2.forward = MistralAttention_fast_forward
@@ -275,7 +288,8 @@ class FastMistralModel(FastLlamaModel):
         MistralModel          .forward = LlamaModel_fast_forward
         MistralForCausalLM    .forward = MistralForCausalLM_fast_forward
         PeftModelForCausalLM  .forward = PeftModelForCausalLM_fast_forward
-
+        fix_prepare_inputs_for_generation(MistralForCausalLM)
+        
         # Solves https://github.com/unslothai/unsloth/issues/168
         # Static KV Cache was introduced in 4.38.0, causing training to be much slower.
         # Inferene can now be CUDAGraphed, but we shall retain the old rotary embeddings.

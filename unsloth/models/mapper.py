@@ -47,9 +47,11 @@ __INT_TO_FLOAT_MAPPER = \
         "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
     ),
     "unsloth/mistral-7b-instruct-v0.1-bnb-4bit" : (
+        "unsloth/mistral-7b-instruct-v0.1",
         "mistralai/Mistral-7B-Instruct-v0.1",
     ),
     "unsloth/mistral-7b-instruct-v0.2-bnb-4bit" : (
+        "unsloth/mistral-7b-instruct-v0.2",
         "mistralai/Mistral-7B-Instruct-v0.2",
     ),
     "unsloth/llama-2-7b-chat-bnb-4bit" : (
@@ -188,6 +190,25 @@ __INT_TO_FLOAT_MAPPER = \
     ),
     "mistralai/Codestral-22B-v0.1" : (
         "mistral-community/Codestral-22B-v0.1",
+    ),
+    "unsloth/gemma-2-9b-bnb-4bit" : (
+        "unsloth/gemma-2-9b",
+        "google/gemma-2-9b",
+    ),
+    "unsloth/gemma-2-27b-bnb-4bit" : (
+        "unsloth/gemma-2-27b",
+        "google/gemma-2-27b",
+    ),
+    "unsloth/gemma-2-9b-it-bnb-4bit" : (
+        "unsloth/gemma-2-9b-it",
+        "google/gemma-2-9b-it",
+    ),
+    "unsloth/gemma-2-27b-it-bnb-4bit" : (
+        "unsloth/gemma-2-27b-it",
+        "google/gemma-2-27b-it",
+    ),
+    "unsloth/Phi-3-mini-4k-instruct-v0-bnb-4bit" : ( # Old Phi pre July
+        "unsloth/Phi-3-mini-4k-instruct-v0",
     ),
 }
 

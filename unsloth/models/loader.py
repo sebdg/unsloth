@@ -22,13 +22,16 @@ from .mapper import INT_TO_FLOAT_MAPPER, FLOAT_TO_INT_MAPPER
 import os
 
 # https://github.com/huggingface/transformers/pull/26037 allows 4 bit loading!
-major, minor = transformers_version.split(".")[:2]
-major, minor = int(major), int(minor)
-SUPPORTS_FOURBIT = (major > 4) or (major == 4 and minor >= 37)
-SUPPORTS_GEMMA   = (major > 4) or (major == 4 and minor >= 38)
+from packaging.version import Version
+transformers_version = Version(transformers_version)
+SUPPORTS_FOURBIT = transformers_version >= Version("4.37")
+SUPPORTS_GEMMA   = transformers_version >= Version("4.38")
+SUPPORTS_GEMMA2  = transformers_version >= Version("4.42")
 if SUPPORTS_GEMMA:
-    from .gemma import FastGemmaModel
-del major, minor
+    from .gemma  import FastGemmaModel
+if SUPPORTS_GEMMA2:
+    from .gemma2 import FastGemma2Model
+pass
 
 
 def _get_model_name(model_name, load_in_4bit = True):
@@ -91,21 +94,38 @@ class FastLanguageModel(FastLlamaModel):
         model_name = _get_model_name(model_name, load_in_4bit)
 
         # First check if it's a normal model via AutoConfig
-        is_peft = False
         try:
             model_config = AutoConfig.from_pretrained(model_name, token = token, revision = revision)
-            is_peft = False
+            is_model = True
         except:
-            try:
-                # Most likely a PEFT model
-                peft_config = PeftConfig.from_pretrained(model_name, token = token, revision = revision)
-            except:
-                raise RuntimeError(f"Unsloth: `{model_name}` is not a full model or a PEFT model.")
-            
+            is_model = False
+        try:
+            peft_config = PeftConfig .from_pretrained(model_name, token = token, revision = revision)
+            is_peft = True
+        except:
+            is_peft = False
+
+        # Cannot be both!
+        if is_model and is_peft:
+            raise RuntimeError(
+                "Unsloth: Your repo has a LoRA adapter and a base model.\n"\
+                "You have 2 files `config.json` and `adapter_config.json`.\n"\
+                "We must only allow one config file.\n"\
+                "Please separate the LoRA and base models to 2 repos."
+            )
+        elif not is_model and not is_peft:
+            raise RuntimeError(
+                f"Unsloth: `{model_name}` is not a base model or a PEFT model.\n"\
+                "We could not locate a `config.json` or `adapter_config.json` file.\n"\
+                "Are you certain the model name is correct? Does it actually exist?"
+            )
+        pass
+
+        # Get base model for PEFT:
+        if is_peft:
             # Check base model again for PEFT
             model_name = _get_model_name(peft_config.base_model_name_or_path, load_in_4bit)
-            model_config = AutoConfig.from_pretrained(model_name, token = token)
-            is_peft = True
+            model_config = AutoConfig.from_pretrained(model_name, token = token, revision = revision)
         pass
 
         model_type = model_config.model_type
@@ -114,13 +134,22 @@ class FastLanguageModel(FastLlamaModel):
         elif model_type == "mistral": dispatch_model = FastMistralModel
         elif model_type == "gemma":
             if not SUPPORTS_GEMMA:
-                raise RuntimeError(
+                raise ImportError(
                     f"Unsloth: Your transformers version of {transformers_version} does not support Gemma.\n"\
                     f"The minimum required version is 4.38.\n"\
                     f'Try `pip install --upgrade "transformers>=4.38"`\n'\
                     f"to obtain the latest transformers build, then restart this session."\
                 )
             dispatch_model = FastGemmaModel
+        elif model_type == "gemma2":
+            if not SUPPORTS_GEMMA2:
+                raise ImportError(
+                    f"Unsloth: Your transformers version of {transformers_version} does not support Gemma2.\n"\
+                    f"The minimum required version is 4.42.3.\n"\
+                    f'Try `pip install --upgrade "transformers>=4.42.3"`\n'\
+                    f"to obtain the latest transformers build, then restart this session."\
+                )
+            dispatch_model = FastGemma2Model
         elif model_type == "qwen2":
             dispatch_model = FastQwen2Model
         else:
